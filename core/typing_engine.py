@@ -315,7 +315,10 @@ class TypingEngine(QObject):
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._thread.quit)
         self._worker.finished.connect(self._worker.deleteLater)
-        self._thread.finished.connect(self._thread.deleteLater)
+        # NOTE: do NOT connect thread.finished → thread.deleteLater here.
+        # Instead connect to our own slot so we can null-out Python references
+        # BEFORE Qt destroys the C++ object, preventing libshiboken crashes.
+        self._thread.finished.connect(self._on_thread_finished)
 
         self._worker.state_changed.connect(self.state_changed)
         self._worker.progress_updated.connect(self.progress_updated)
@@ -353,18 +356,45 @@ class TypingEngine(QObject):
                 self.pause()
 
     def is_active(self) -> bool:
-        return self._thread is not None and self._thread.isRunning()
+        if self._thread is None:
+            return False
+        try:
+            return self._thread.isRunning()
+        except RuntimeError:
+            # C++ QThread object already deleted by Qt — treat as not active
+            self._thread = None
+            self._worker = None
+            return False
 
     # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
 
+    @Slot()
+    def _on_thread_finished(self) -> None:
+        """Called when the QThread finishes. Null out references BEFORE deleteLater
+        so that is_active() never touches a deleted C++ object."""
+        thread = self._thread
+        self._thread = None
+        self._worker = None
+        if thread is not None:
+            try:
+                thread.deleteLater()
+            except RuntimeError:
+                pass  # Already deleted — safe to ignore
+        logger.debug("Thread finished and cleaned up")
+
     def _cleanup_thread(self) -> None:
-        if self._thread and self._thread.isRunning():
-            if self._worker:
-                self._worker.request_stop()
-            self._thread.quit()
-            self._thread.wait(3000)
+        if self._thread is not None:
+            try:
+                running = self._thread.isRunning()
+            except RuntimeError:
+                running = False
+            if running:
+                if self._worker:
+                    self._worker.request_stop()
+                self._thread.quit()
+                self._thread.wait(3000)
         self._thread = None
         self._worker = None
 
