@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 PROVIDER_PRESETS: dict[str, dict] = {
     "OpenRouter": {
         "base_url": "https://openrouter.ai/api/v1",
-        "default_model": "google/gemma-3n-e4b-it:free",
+        "default_model": "google/gemma-4-31b-it:free",
     },
     "OpenAI": {
         "base_url": "https://api.openai.com/v1",
