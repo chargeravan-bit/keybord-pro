@@ -1,0 +1,1 @@
+"""AutoKeyboard Pro — Tests package."""
