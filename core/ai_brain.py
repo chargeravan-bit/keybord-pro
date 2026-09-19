@@ -351,22 +351,34 @@ class AiBrainWorker(QThread):
         api_key: str,
         base_url: str,
         model: str,
+        screenshot_b64: str = "",
+        clipboard_text: str = "",
         parent: Optional[QObject] = None,
     ):
         super().__init__(parent)
-        self._api_key  = api_key
-        self._base_url = base_url
-        self._model    = model
+        self._api_key       = api_key
+        self._base_url      = base_url
+        self._model         = model
+        self._screenshot_b64 = screenshot_b64
+        self._clipboard_text = clipboard_text
 
     @Slot()
     def run(self) -> None:
         try:
-            self.status.emit("📸  Capturing screen…")
-            screenshot_b64 = capture_screen_base64()
-
-            self.status.emit("📋  Reading clipboard…")
-            clipboard_text = get_clipboard_text()
-            logger.info("AI Brain: clipboard=%d chars", len(clipboard_text))
+            # Use pre-captured data if provided (preferred — captured while window was hidden)
+            # Otherwise fall back to capturing here (legacy / test path)
+            if self._screenshot_b64:
+                screenshot_b64 = self._screenshot_b64
+                clipboard_text = self._clipboard_text
+                logger.info("AI Brain: using pre-captured screenshot, clipboard=%d chars",
+                            len(clipboard_text))
+            else:
+                self.status.emit("📸  Capturing screen…")
+                screenshot_b64 = capture_screen_base64()
+                self.status.emit("📋  Reading clipboard…")
+                clipboard_text = get_clipboard_text()
+                logger.info("AI Brain: captured on worker thread, clipboard=%d chars",
+                            len(clipboard_text))
 
             # Build the list of models to try:
             # primary model first, then the full free fallback chain

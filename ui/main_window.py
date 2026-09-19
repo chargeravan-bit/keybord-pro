@@ -438,7 +438,8 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_ai_brain(self):
         """Hotkey handler: capture screen + clipboard, query AI, auto-type result."""
-        from core.ai_brain import AiBrainWorker
+        from core.ai_brain import AiBrainWorker, capture_screen_base64, get_clipboard_text
+        import time
 
         # Guard: already running?
         if self._ai_worker is not None and self._ai_worker.isRunning():
@@ -453,15 +454,38 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Show overlay
+        # ── Hide THIS window before taking screenshot ──────────────────
+        # So the AI sees the user's actual content, not our app's UI.
+        was_visible = self.isVisible()
+        self.hide()
+        from PySide6.QtWidgets import QApplication
+        QApplication.processEvents()   # let Qt actually hide the window
+        time.sleep(0.25)               # give OS time to repaint the screen
+
+        # ── Capture screenshot + clipboard NOW (window is hidden) ───────
+        try:
+            screenshot_b64 = capture_screen_base64()
+            clipboard_text = get_clipboard_text()
+        except Exception as exc:
+            if was_visible:
+                self.show()
+            self._show_error("AI Brain — Capture Error", str(exc))
+            return
+        finally:
+            if was_visible:
+                self.show()            # restore window immediately after capture
+
+        # ── Show overlay ────────────────────────────────────────────────
         self._ai_overlay = AiOverlay()
         self._ai_overlay.show()
 
-        # Build and start worker
+        # ── Build and start worker (screenshot already captured) ────────
         worker = AiBrainWorker(
             api_key=self._settings.ai_api_key,
             base_url=self._settings.ai_base_url,
             model=self._settings.ai_model,
+            screenshot_b64=screenshot_b64,
+            clipboard_text=clipboard_text,
             parent=self,
         )
         worker.status.connect(self._on_ai_status)
