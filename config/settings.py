@@ -49,6 +49,13 @@ class AppSettings:
     # Appearance
     theme: str = "Dark"               # Dark | Light | System
 
+    # AI Brain
+    ai_provider: str = "OpenRouter"    # OpenRouter | OpenAI | Gemini | Custom
+    ai_api_key: str = ""
+    ai_base_url: str = "https://openrouter.ai/api/v1"  # custom endpoint base URL
+    ai_model: str = "google/gemma-3n-e4b-it:free"     # any model slug
+    ai_brain_hotkey: str = "ctrl+shift+alt+b"
+
     # Permission
     permission_granted: bool = False
 

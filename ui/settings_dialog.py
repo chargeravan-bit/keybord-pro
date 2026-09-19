@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QLabel, QSlider, QSpinBox, QDoubleSpinBox, QComboBox,
     QCheckBox, QRadioButton, QPushButton, QButtonGroup,
     QFormLayout, QGroupBox, QLineEdit, QFrame, QSizePolicy,
-    QDialogButtonBox
+    QDialogButtonBox, QMessageBox
 )
 
 from config.settings import AppSettings
@@ -121,6 +121,7 @@ class SettingsDialog(QDialog):
         self._tabs.addTab(self._build_safety_tab(), "Safety")
         self._tabs.addTab(self._build_hotkeys_tab(), "Hotkeys")
         self._tabs.addTab(self._build_appearance_tab(), "Appearance")
+        self._tabs.addTab(self._build_ai_brain_tab(), "🧠 AI Brain")
 
         # Buttons
         btn_box = QDialogButtonBox(
@@ -297,6 +298,168 @@ class SettingsDialog(QDialog):
         layout.addStretch()
         return w
 
+    def _build_ai_brain_tab(self) -> QWidget:
+        """AI Brain settings: provider, API key, base URL, model, hotkey."""
+        from core.ai_brain import PROVIDER_PRESETS
+
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(14)
+
+        # ── Provider ──────────────────────────────────────────────────
+        provider_group = QGroupBox("AI PROVIDER")
+        provider_form = QFormLayout(provider_group)
+        provider_form.setSpacing(10)
+
+        self._ai_provider_combo = QComboBox()
+        self._ai_provider_combo.addItems(["OpenRouter", "OpenAI", "Gemini", "Custom"])
+        idx = self._ai_provider_combo.findText(self._settings.ai_provider)
+        self._ai_provider_combo.setCurrentIndex(max(0, idx))
+        self._ai_provider_combo.currentTextChanged.connect(self._on_ai_provider_changed)
+        provider_form.addRow("Provider:", self._ai_provider_combo)
+
+        self._ai_key_edit = QLineEdit(self._settings.ai_api_key)
+        self._ai_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._ai_key_edit.setPlaceholderText("Paste your API key here…")
+        self._ai_key_edit.setToolTip("Your API key — stored locally on this machine only")
+
+        key_row = QHBoxLayout()
+        key_row.setSpacing(6)
+        key_row.addWidget(self._ai_key_edit, 1)
+        self._show_key_btn = QPushButton("👁")
+        self._show_key_btn.setFixedWidth(36)
+        self._show_key_btn.setCheckable(True)
+        self._show_key_btn.setToolTip("Show / hide API key")
+        self._show_key_btn.toggled.connect(
+            lambda on: self._ai_key_edit.setEchoMode(
+                QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password
+            )
+        )
+        key_row.addWidget(self._show_key_btn)
+        self._test_api_btn = QPushButton("⚡ Test")
+        self._test_api_btn.setFixedWidth(72)
+        self._test_api_btn.setToolTip("Send a quick test request to verify the key works")
+        self._test_api_btn.clicked.connect(self._test_ai_connection)
+        key_row.addWidget(self._test_api_btn)
+
+        provider_form.addRow("API Key:", key_row)
+
+        self._ai_base_url_edit = QLineEdit(self._settings.ai_base_url)
+        self._ai_base_url_edit.setPlaceholderText("https://openrouter.ai/api/v1")
+        self._ai_base_url_edit.setToolTip(
+            "Base URL for any OpenAI-compatible endpoint\n"
+            "(auto-filled when you choose a preset provider)"
+        )
+        provider_form.addRow("Base URL:", self._ai_base_url_edit)
+
+        self._ai_model_edit = QLineEdit(self._settings.ai_model)
+        self._ai_model_edit.setPlaceholderText("e.g. google/gemma-3n-e4b-it:free")
+        self._ai_model_edit.setToolTip(
+            "Model slug sent to the API.\n"
+            "OpenRouter examples: google/gemma-3n-e4b-it:free, mistralai/mistral-7b-instruct:free\n"
+            "OpenAI examples: gpt-4o, gpt-4o-mini\n"
+            "Gemini examples: gemini-2.0-flash"
+        )
+        provider_form.addRow("Model:", self._ai_model_edit)
+
+        layout.addWidget(provider_group)
+
+        # ── Hotkey ────────────────────────────────────────────────────
+        hk_group = QGroupBox("AI BRAIN HOTKEY")
+        hk_form = QFormLayout(hk_group)
+        self._hk_ai_brain = HotkeyEdit(self._settings.ai_brain_hotkey)
+        hk_form.addRow("Trigger:", self._hk_ai_brain)
+        layout.addWidget(hk_group)
+
+        # ── Privacy notice ────────────────────────────────────────────
+        notice = QLabel(
+            "⚠  When triggered, AI Brain takes a screenshot of your entire screen "
+            "and reads your clipboard, then sends both to the configured AI provider "
+            "over the internet. No data is stored on disk by AutoKeyboard Pro. "
+            "Ensure you are comfortable with your chosen provider's privacy policy."
+        )
+        notice.setWordWrap(True)
+        notice.setStyleSheet(
+            "color: #9090a8; font-size: 11px; background: #1a1016; "
+            "border: 1px solid #5a2e2e; border-radius: 8px; padding: 10px;"
+        )
+        layout.addWidget(notice)
+        layout.addStretch()
+        return w
+
+    def _on_ai_provider_changed(self, provider: str):
+        """Auto-fill base URL and model when a preset provider is selected."""
+        from core.ai_brain import PROVIDER_PRESETS
+        preset = PROVIDER_PRESETS.get(provider, {})
+        if preset.get("base_url"):
+            self._ai_base_url_edit.setText(preset["base_url"])
+        if preset.get("default_model"):
+            self._ai_model_edit.setText(preset["default_model"])
+
+    def _test_ai_connection(self):
+        """Send a minimal text-only ping to verify the API key and endpoint."""
+        import threading
+        import json
+        import urllib.request
+        import urllib.error
+
+        key = self._ai_key_edit.text().strip()
+        base_url = self._ai_base_url_edit.text().strip()
+        model = self._ai_model_edit.text().strip()
+
+        if not key:
+            QMessageBox.warning(self, "API Key Missing", "Please enter an API key first.")
+            return
+        if not base_url:
+            QMessageBox.warning(self, "Base URL Missing", "Please enter a base URL.")
+            return
+
+        self._test_api_btn.setEnabled(False)
+        self._test_api_btn.setText("…")
+
+        def _do_test():
+            try:
+                endpoint = base_url.rstrip("/") + "/chat/completions"
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
+                    "max_tokens": 8,
+                }
+                data = json.dumps(payload).encode()
+                req = urllib.request.Request(
+                    endpoint, data=data,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {key}",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    result = json.loads(resp.read())
+                    answer = result["choices"][0]["message"]["content"].strip()
+                from PySide6.QtCore import QMetaObject, Qt
+                from PySide6.QtWidgets import QApplication
+                # Post result to GUI thread
+                self._test_result = (True, f"✓ Connected!  Model replied: {answer!r}")
+            except Exception as exc:
+                self._test_result = (False, str(exc))
+            from PySide6.QtCore import QMetaObject, Qt
+            QMetaObject.invokeMethod(self, "_show_test_result", Qt.ConnectionType.QueuedConnection)
+
+        threading.Thread(target=_do_test, daemon=True).start()
+
+    def _show_test_result(self):
+        """Called on the GUI thread after _test_ai_connection finishes."""
+        self._test_api_btn.setEnabled(True)
+        self._test_api_btn.setText("⚡ Test")
+        ok, msg = getattr(self, "_test_result", (False, "No result"))
+        if ok:
+            QMessageBox.information(self, "AI Connection Test", msg)
+        else:
+            QMessageBox.warning(self, "AI Connection Test Failed", msg)
+
+
     # ──────────────────────────────────────────────────────────────────
     # Save
     # ──────────────────────────────────────────────────────────────────
@@ -325,6 +488,13 @@ class SettingsDialog(QDialog):
         # Appearance
         themes = ["Dark", "Light", "System"]
         s.theme = themes[self._theme_group.checkedId()]
+
+        # AI Brain
+        s.ai_provider    = self._ai_provider_combo.currentText()
+        s.ai_api_key     = self._ai_key_edit.text().strip()
+        s.ai_base_url    = self._ai_base_url_edit.text().strip()
+        s.ai_model       = self._ai_model_edit.text().strip()
+        s.ai_brain_hotkey = self._hk_ai_brain.combo or s.ai_brain_hotkey
 
         s.save()
         self.settings_changed.emit(s)

@@ -32,6 +32,7 @@ from ui.widgets import (
 )
 from ui.settings_dialog import SettingsDialog
 from ui.permission_dialog import PermissionDialog
+from ui.ai_overlay import AiOverlay
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,8 @@ class MainWindow(QMainWindow):
         self._engine = TypingEngine(self)
         self._current_state = TypingState.IDLE.value
         self._is_test_mode = False
+        self._ai_worker: Optional[object] = None
+        self._ai_overlay: Optional[AiOverlay] = None
 
         self._setup_window()
         self._build_ui()
@@ -396,6 +399,10 @@ class MainWindow(QMainWindow):
             "stop", self._settings.hotkey_stop,
             self._trigger_stop, "Emergency Stop"
         )
+        ok_ai = self._hotkey_mgr.register(
+            "ai_brain", self._settings.ai_brain_hotkey,
+            self._trigger_ai_brain, "AI Brain"
+        )
         if not (ok_start and ok_pause and ok_stop):
             logger.warning("One or more global hotkeys failed to register")
             self._status_bar.showMessage(
@@ -403,6 +410,8 @@ class MainWindow(QMainWindow):
                 "Try running as Administrator.",
                 8000
             )
+        if not ok_ai:
+            logger.warning("AI Brain hotkey failed to register")
 
     def _trigger_arm(self):
         """Called from hotkey thread — must post to GUI thread."""
@@ -416,6 +425,84 @@ class MainWindow(QMainWindow):
     def _trigger_stop(self):
         from PySide6.QtCore import QMetaObject, Qt
         QMetaObject.invokeMethod(self, "_on_stop", Qt.ConnectionType.QueuedConnection)
+
+    def _trigger_ai_brain(self):
+        """Called from hotkey thread — posts AI Brain trigger to GUI thread."""
+        from PySide6.QtCore import QMetaObject, Qt
+        QMetaObject.invokeMethod(self, "_on_ai_brain", Qt.ConnectionType.QueuedConnection)
+
+    # ──────────────────────────────────────────────────────────────────
+    # AI Brain
+    # ──────────────────────────────────────────────────────────────────
+
+    @Slot()
+    def _on_ai_brain(self):
+        """Hotkey handler: capture screen + clipboard, query AI, auto-type result."""
+        from core.ai_brain import AiBrainWorker
+
+        # Guard: already running?
+        if self._ai_worker is not None and self._ai_worker.isRunning():
+            self._status_bar.showMessage("AI Brain is already running…", 3000)
+            return
+
+        # Guard: no API key configured
+        if not self._settings.ai_api_key.strip():
+            self._show_error(
+                "AI Brain — API Key Missing",
+                "Please open Settings → 🧠 AI Brain and enter your API key first."
+            )
+            return
+
+        # Show overlay
+        self._ai_overlay = AiOverlay()
+        self._ai_overlay.show()
+
+        # Build and start worker
+        worker = AiBrainWorker(
+            api_key=self._settings.ai_api_key,
+            base_url=self._settings.ai_base_url,
+            model=self._settings.ai_model,
+            parent=self,
+        )
+        worker.status.connect(self._on_ai_status)
+        worker.result.connect(self._on_ai_result)
+        worker.error.connect(self._on_ai_error)
+        worker.finished.connect(self._on_ai_finished)
+        self._ai_worker = worker
+        worker.start()
+        logger.info("AI Brain worker started")
+
+    @Slot(str)
+    def _on_ai_status(self, msg: str):
+        """Update overlay and status bar with progress message."""
+        self._status_bar.showMessage(msg)
+        if self._ai_overlay:
+            self._ai_overlay.set_status(msg)
+
+    @Slot(str)
+    def _on_ai_result(self, text: str):
+        """AI returned a result — put it in the text editor and auto-arm."""
+        logger.info("AI Brain result received (%d chars)", len(text))
+        # Switch to the Type tab
+        self._tabs.setCurrentIndex(0)
+        self._text_editor.setPlainText(text)
+        # Auto-arm typing
+        self._on_arm()
+
+    @Slot(str)
+    def _on_ai_error(self, msg: str):
+        """AI request failed."""
+        logger.error("AI Brain error: %s", msg)
+        self._status_bar.showMessage(f"AI Brain error: {msg}", 8000)
+        self._show_error("AI Brain Error", msg)
+
+    @Slot()
+    def _on_ai_finished(self):
+        """Worker thread done — dismiss overlay."""
+        if self._ai_overlay:
+            self._ai_overlay.close()
+            self._ai_overlay = None
+        self._ai_worker = None
 
     # ──────────────────────────────────────────────────────────────────
     # User actions
