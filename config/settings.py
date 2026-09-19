@@ -53,7 +53,7 @@ class AppSettings:
     ai_provider: str = "OpenRouter"    # OpenRouter | OpenAI | Gemini | Custom
     ai_api_key: str = ""
     ai_base_url: str = "https://openrouter.ai/api/v1"  # custom endpoint base URL
-    ai_model: str = "google/gemma-2-9b-it:free"     # any model slug
+    ai_model: str = "qwen/qwen3.8-27b:free"     # any model slug
     ai_brain_hotkey: str = "ctrl+shift+alt+b"
 
     # Permission
