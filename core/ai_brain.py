@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 PROVIDER_PRESETS: dict[str, dict] = {
     "OpenRouter": {
         "base_url": "https://openrouter.ai/api/v1",
-        "default_model": "qwen/qwen3.8-27b:free",
+        "default_model": "google/gemma-4-31b-it:free",
     },
     "OpenAI": {
         "base_url": "https://api.openai.com/v1",
@@ -42,6 +42,21 @@ PROVIDER_PRESETS: dict[str, dict] = {
         "default_model": "",
     },
 }
+
+# ---------------------------------------------------------------------------
+# Free model fallback chain — tried in order when the primary model fails
+# Keep this list up to date with models confirmed on openrouter.ai/models
+# ---------------------------------------------------------------------------
+OPENROUTER_FREE_MODELS: list[str] = [
+    "google/gemma-4-31b-it:free",
+    "google/gemma-4-26b-a4b-it:free",
+    "qwen/qwen3.8-27b:free",
+    "deepseek/deepseek-v4-flash-0731:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "nvidia/nemotron-3.5-lightning:free",
+    "liquid/lfm-2.5-2.6b:free",
+    "inclusionai/ling-3.0-flash-vl:free",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -252,20 +267,64 @@ def query_ai_text_only(
 
 def _is_vision_error(error_body: str) -> bool:
     """Return True if the HTTP error indicates the model doesn't support images."""
-    keywords = [
-        "does not support image",
-        "not support vision",
-        "image_url",
-        "multimodal",
-        "vision",
-        "not a valid model",
-        "invalid model",
-        "model not found",
-        "no endpoints found",
-        "unsupported content",
-    ]
+def _classify_error(error_body: str) -> str:
+    """
+    Classify an API error string.
+    Returns: 'vision'  — model does not support images
+             'ratelimit' — model is rate-limited / unavailable
+             'other'  — unrecoverable error
+    """
     lower = error_body.lower()
-    return any(k in lower for k in keywords)
+    vision_keywords = [
+        "does not support image", "not support vision", "image_url",
+        "multimodal", "not a valid model", "invalid model",
+        "model not found", "no endpoints found", "unsupported content",
+    ]
+    rate_keywords = [
+        "rate-limit", "rate limit", "ratelimit", "429",
+        "temporarily", "upstream", "retry shortly", "quota",
+        "overloaded", "capacity", "provider returned error",
+    ]
+    if any(k in lower for k in vision_keywords):
+        return "vision"
+    if any(k in lower for k in rate_keywords):
+        return "ratelimit"
+    return "other"
+
+
+def _is_vision_error(error_body: str) -> bool:
+    return _classify_error(error_body) == "vision"
+
+
+def _try_one_model(
+    api_key: str,
+    base_url: str,
+    model: str,
+    screenshot_b64: str,
+    clipboard_text: str,
+) -> str:
+    """
+    Try vision first, fall back to text-only if vision is not supported.
+    Raises RuntimeError with a classified message on failure.
+    """
+    try:
+        return query_ai(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            screenshot_b64=screenshot_b64,
+            clipboard_text=clipboard_text,
+        )
+    except RuntimeError as exc:
+        if _is_vision_error(str(exc)):
+            logger.warning("Model %s: no vision support, trying text-only", model)
+            return query_ai_text_only(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                clipboard_text=clipboard_text,
+            )
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -275,14 +334,17 @@ def _is_vision_error(error_body: str) -> bool:
 class AiBrainWorker(QThread):
     """
     Runs the screenshot → AI query pipeline on a background thread.
-    Automatically falls back to text-only mode if the chosen model
-    does not support vision (image) inputs.
-    Emits `result` with the answer text, or `error` with an error message.
+
+    Strategy:
+      1. Try the user's chosen model (vision, then text-only fallback).
+      2. If rate-limited or unavailable, automatically cycle through
+         OPENROUTER_FREE_MODELS until one responds.
+      3. Emit result on success, error on total failure.
     """
 
     result = Signal(str)
     error  = Signal(str)
-    status = Signal(str)   # short progress messages for the overlay
+    status = Signal(str)
 
     def __init__(
         self,
@@ -300,48 +362,65 @@ class AiBrainWorker(QThread):
     def run(self) -> None:
         try:
             self.status.emit("📸  Capturing screen…")
-            logger.info("AI Brain: capturing screen")
             screenshot_b64 = capture_screen_base64()
 
             self.status.emit("📋  Reading clipboard…")
             clipboard_text = get_clipboard_text()
-            logger.info("AI Brain: clipboard has %d chars", len(clipboard_text))
+            logger.info("AI Brain: clipboard=%d chars", len(clipboard_text))
 
-            # ── Try vision first ──────────────────────────────────────
-            self.status.emit("🧠  Thinking… (vision mode)")
-            logger.info("AI Brain: querying %s @ %s", self._model, self._base_url)
+            # Build the list of models to try:
+            # primary model first, then the full free fallback chain
+            is_openrouter = "openrouter" in self._base_url.lower()
+            fallbacks = (
+                [m for m in OPENROUTER_FREE_MODELS if m != self._model]
+                if is_openrouter else []
+            )
+            models_to_try = [self._model] + fallbacks
+            total = len(models_to_try)
+            last_error = "No models available."
 
-            try:
-                answer = query_ai(
-                    api_key=self._api_key,
-                    base_url=self._base_url,
-                    model=self._model,
-                    screenshot_b64=screenshot_b64,
-                    clipboard_text=clipboard_text,
-                )
-                logger.info("AI Brain: vision response (%d chars)", len(answer))
-                self.result.emit(answer)
-                return
+            for idx, model in enumerate(models_to_try, start=1):
+                label = f"({idx}/{total})" if total > 1 else ""
+                self.status.emit(f"🧠  Thinking… {label}")
+                logger.info("AI Brain: trying model %s [%d/%d]", model, idx, total)
 
-            except RuntimeError as vision_err:
-                err_msg = str(vision_err)
-                if _is_vision_error(err_msg):
-                    # ── Auto-fallback to text-only ────────────────────
-                    logger.warning(
-                        "AI Brain: model does not support vision, falling back to text-only"
-                    )
-                    self.status.emit("✏️  Text-only mode (model has no vision)…")
-                    answer = query_ai_text_only(
+                try:
+                    answer = _try_one_model(
                         api_key=self._api_key,
                         base_url=self._base_url,
-                        model=self._model,
+                        model=model,
+                        screenshot_b64=screenshot_b64,
                         clipboard_text=clipboard_text,
                     )
-                    logger.info("AI Brain: text-only response (%d chars)", len(answer))
+                    if not answer:
+                        logger.warning("Model %s returned empty response, skipping", model)
+                        last_error = f"Model {model} returned an empty response."
+                        continue
+
+                    logger.info("AI Brain: success with %s (%d chars)", model, len(answer))
+                    self.status.emit(f"✅  Done ({model})")
                     self.result.emit(answer)
-                else:
-                    # Real error — propagate it
-                    raise
+                    return
+
+                except RuntimeError as exc:
+                    err_msg = str(exc)
+                    kind = _classify_error(err_msg)
+                    last_error = err_msg
+                    if kind == "ratelimit" and idx < total:
+                        logger.warning("Model %s rate-limited, trying next…", model)
+                        self.status.emit(f"⏳  Rate-limited, trying next model… ({idx}/{total})")
+                        continue
+                    elif kind == "other" or idx == total:
+                        # Unrecoverable or last model
+                        raise RuntimeError(last_error) from exc
+                    # vision error already handled by _try_one_model
+
+            # All models exhausted
+            raise RuntimeError(
+                f"All {total} models failed or were rate-limited.\n"
+                f"Last error: {last_error}\n\n"
+                "Tip: Wait a minute and try again, or get a paid API key."
+            )
 
         except Exception as exc:
             logger.error("AI Brain error: %s", exc, exc_info=True)
