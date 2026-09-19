@@ -179,6 +179,95 @@ def query_ai(
         raise RuntimeError(f"API error {exc.code}: {body}") from exc
 
 
+def query_ai_text_only(
+    api_key: str,
+    base_url: str,
+    model: str,
+    clipboard_text: str,
+    prompt_override: Optional[str] = None,
+) -> str:
+    """
+    Text-only fallback — no image attached.
+    Used automatically when the chosen model does not support vision.
+    """
+    import json
+    import urllib.request
+    import urllib.error
+
+    if prompt_override:
+        system_prompt = prompt_override
+    else:
+        system_prompt = (
+            "You are a helpful AI assistant embedded in a keyboard automation tool. "
+            "The user has copied some text to their clipboard. "
+            "Respond helpfully to the content below. "
+            "Keep your response concise and ready to be typed as plain text — "
+            "avoid markdown, bullet symbols, or emojis unless specifically asked."
+        )
+
+    if clipboard_text.strip():
+        user_text = (
+            f"The user has copied the following text to their clipboard:\n\n"
+            f"{clipboard_text}\n\n"
+            "Please answer the question or complete the task above."
+        )
+    else:
+        user_text = (
+            "The user triggered the AI Brain hotkey but no text is in their clipboard. "
+            "Please greet them and ask what they need help with."
+        )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text},
+        ],
+        "max_tokens": 1024,
+    }
+
+    endpoint = base_url.rstrip("/") + "/chat/completions"
+    data = json.dumps(payload).encode("utf-8")
+
+    req = urllib.request.Request(
+        endpoint,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "HTTP-Referer": "https://github.com/autokeyboard-pro",
+            "X-Title": "AutoKeyboard Pro",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            return result["choices"][0]["message"]["content"].strip()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"API error {exc.code}: {body}") from exc
+
+
+def _is_vision_error(error_body: str) -> bool:
+    """Return True if the HTTP error indicates the model doesn't support images."""
+    keywords = [
+        "does not support image",
+        "not support vision",
+        "image_url",
+        "multimodal",
+        "vision",
+        "not a valid model",
+        "invalid model",
+        "model not found",
+        "no endpoints found",
+        "unsupported content",
+    ]
+    lower = error_body.lower()
+    return any(k in lower for k in keywords)
+
+
 # ---------------------------------------------------------------------------
 # QThread worker
 # ---------------------------------------------------------------------------
@@ -186,6 +275,8 @@ def query_ai(
 class AiBrainWorker(QThread):
     """
     Runs the screenshot → AI query pipeline on a background thread.
+    Automatically falls back to text-only mode if the chosen model
+    does not support vision (image) inputs.
     Emits `result` with the answer text, or `error` with an error message.
     """
 
@@ -214,23 +305,43 @@ class AiBrainWorker(QThread):
 
             self.status.emit("📋  Reading clipboard…")
             clipboard_text = get_clipboard_text()
-            logger.info(
-                "AI Brain: clipboard has %d chars", len(clipboard_text)
-            )
+            logger.info("AI Brain: clipboard has %d chars", len(clipboard_text))
 
-            self.status.emit("🧠  Thinking…")
-            logger.info(
-                "AI Brain: querying %s @ %s", self._model, self._base_url
-            )
-            answer = query_ai(
-                api_key=self._api_key,
-                base_url=self._base_url,
-                model=self._model,
-                screenshot_b64=screenshot_b64,
-                clipboard_text=clipboard_text,
-            )
-            logger.info("AI Brain: got response (%d chars)", len(answer))
-            self.result.emit(answer)
+            # ── Try vision first ──────────────────────────────────────
+            self.status.emit("🧠  Thinking… (vision mode)")
+            logger.info("AI Brain: querying %s @ %s", self._model, self._base_url)
+
+            try:
+                answer = query_ai(
+                    api_key=self._api_key,
+                    base_url=self._base_url,
+                    model=self._model,
+                    screenshot_b64=screenshot_b64,
+                    clipboard_text=clipboard_text,
+                )
+                logger.info("AI Brain: vision response (%d chars)", len(answer))
+                self.result.emit(answer)
+                return
+
+            except RuntimeError as vision_err:
+                err_msg = str(vision_err)
+                if _is_vision_error(err_msg):
+                    # ── Auto-fallback to text-only ────────────────────
+                    logger.warning(
+                        "AI Brain: model does not support vision, falling back to text-only"
+                    )
+                    self.status.emit("✏️  Text-only mode (model has no vision)…")
+                    answer = query_ai_text_only(
+                        api_key=self._api_key,
+                        base_url=self._base_url,
+                        model=self._model,
+                        clipboard_text=clipboard_text,
+                    )
+                    logger.info("AI Brain: text-only response (%d chars)", len(answer))
+                    self.result.emit(answer)
+                else:
+                    # Real error — propagate it
+                    raise
 
         except Exception as exc:
             logger.error("AI Brain error: %s", exc, exc_info=True)
